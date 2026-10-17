@@ -9,17 +9,15 @@ import * as tasksMod from '../server/handlers/tasks';
 const getHandler = (mod: any) => mod.default || mod.handler || mod;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Extract path from query (Vercel catch-all rewrites pass query params)
-  const pathParam = req.query.path || req.query.rest || req.url?.replace(/^\/api\/?/, '').split('?')[0];
-  const segments = Array.isArray(pathParam) ? pathParam : typeof pathParam === 'string' ? pathParam.split('/') : [];
-  const route = segments.filter(Boolean).join('/');
-
-  // Fallback check if route is empty or matches root api
-  if (!route || route === '') {
-    return res.status(200).json({ status: 'LaunchPilot AI API operational', endpoints: ['competitors', 'contact', 'projects', 'settings', 'tasks'] });
-  }
-
   try {
+    const { path } = req.query;
+    const segments = Array.isArray(path) ? path : path ? [path] : [];
+    const route = segments.join('/');
+
+    if (!route || route === '') {
+      return res.status(200).json({ status: 'API Operational', endpoints: ['competitors', 'contact', 'projects', 'settings', 'tasks'] });
+    }
+
     if (route.startsWith('competitors')) return await getHandler(competitorsMod)(req, res);
     if (route.startsWith('contact')) return await getHandler(contactMod)(req, res);
     if (route.startsWith('projects')) return await getHandler(projectsMod)(req, res);
@@ -28,10 +26,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     return res.status(404).json({ error: `API route not found: /api/${route}` });
   } catch (error: any) {
-    console.error(`API Error on route /api/${route}:`, error);
+    console.error('Unhandled API Router Exception:', error);
     return res.status(500).json({
       error: 'Internal Server Error',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
+      message: error?.message || 'Unknown server error',
     });
   }
 }
