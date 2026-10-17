@@ -1,0 +1,669 @@
+﻿LAUNCHPILOT AI API INSPECTION
+
+========== BUILD SCRIPT ==========
+import { execFileSync } from 'node:child_process';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = dirname(fileURLToPath(import.meta.url));
+const output = join(root, 'dist');
+
+// Prisma needs URL-shaped datasource values while generating its client, but it
+// does not connect to the database during generation. Placeholders are passed
+// to this child process only when real values have not been configured; they
+// are never written to .env or to the deployment environment.
+const env = { ...process.env };
+const fallbackDatabaseUrl = 'postgresql://placeholder:placeholder@127.0.0.1:5432/launchpilot_placeholder?schema=public';
+env.DATABASE_URL ||= fallbackDatabaseUrl;
+env.DIRECT_URL ||= env.DATABASE_URL;
+const prismaCommand = join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'prisma.cmd' : 'prisma');
+execFileSync(prismaCommand, ['generate'], {
+  cwd: root,
+  env,
+  stdio: 'inherit',
+  shell: process.platform === 'win32'
+});
+
+// Load only the public checkout URL from a local .env file. Vercel build
+// environment variables take precedence. No secrets are inserted into HTML.
+function parseEnvFile(text) {
+  const values = {};
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (!match || match[1] !== 'WHOP_PRO_CHECKOUT_URL') continue;
+    let value = match[2];
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    values[match[1]] = value;
+  }
+  return values;
+}
+
+const envText = await readFile(join(root, '.env'), 'utf8').catch(() => '');
+const localEnv = parseEnvFile(envText);
+const checkoutUrl = (process.env.WHOP_PRO_CHECKOUT_URL || localEnv.WHOP_PRO_CHECKOUT_URL || '').trim();
+if (checkoutUrl) {
+  let parsedCheckoutUrl;
+  try { parsedCheckoutUrl = new URL(checkoutUrl); } catch { throw new Error('WHOP_PRO_CHECKOUT_URL must be a valid HTTPS Whop checkout URL.'); }
+  if (parsedCheckoutUrl.protocol !== 'https:' || !(parsedCheckoutUrl.hostname === 'whop.com' || parsedCheckoutUrl.hostname.endsWith('.whop.com'))) {
+    throw new Error('WHOP_PRO_CHECKOUT_URL must use HTTPS and a whop.com domain.');
+  }
+}
+
+// The authoring file stays at the repository root. The public checkout URL is
+// injected during build, then only dist/index.html is served as the frontend.
+await rm(output, { recursive: true, force: true });
+await mkdir(output, { recursive: true });
+const html = await readFile(join(root, 'index.html'), 'utf8');
+const marker = "const CHECKOUT_URL = '__WHOP_PRO_CHECKOUT_URL__';";
+if (!html.includes(marker)) throw new Error('Checkout URL marker is missing from index.html.');
+const builtHtml = html.replace(marker, `const CHECKOUT_URL = ${JSON.stringify(checkoutUrl)};`);
+await writeFile(join(output, 'index.html'), builtHtml, 'utf8');
+console.log(checkoutUrl
+  ? 'LaunchPilot AI frontend built to dist/index.html with a configured Whop checkout URL.'
+  : 'LaunchPilot AI frontend built to dist/index.html. Pro checkout buttons are safely disabled until WHOP_PRO_CHECKOUT_URL is configured.');
+
+
+========== API ROUTE SOURCE ==========
+
+========== api\ai\generate.ts ==========
+import { randomUUID } from 'node:crypto';
+import { Prisma } from '@prisma/client';
+import { aiRequestSchema } from '../../lib/validators';
+import { isAiTool, TOOL_DETAILS } from '../../lib/constants';
+import { generateWithGroq } from '../../lib/ai';
+import { failGeneration, getPlanContext, reserveGeneration } from '../../lib/usage';
+import { requireApiUser } from '../../lib/auth';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../../lib/http';
+import { consumeRateLimit } from '../../lib/rate-limit';
+import { db } from '../../lib/db';
+import { canAccessTool } from '../../lib/policy';
+
+export const runtime = 'nodejs';
+export const maxDuration = 60;
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request);
+  if (!user) return response;
+  try {
+    if (!(await consumeRateLimit(`ai:${user.id}`, 12, 60 * 60 * 1000))) return jsonError('You have made too many AI requests. Please try again later.', 429, 'RATE_LIMITED');
+    const raw = await readJsonLimited(request, 18_000);
+    const parsed = aiRequestSchema.safeParse(raw);
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check your inputs.', 400, 'VALIDATION_ERROR');
+    const { tool, input } = parsed.data;
+    if (!isAiTool(tool)) return jsonError('Unknown tool.', 400);
+    const planContext = await getPlanContext(user.id);
+    if (!canAccessTool(planContext.plan, tool)) return jsonError('This feature is available on Pro. Verify your membership or upgrade to continue.', 403, 'PRO_REQUIRED');
+
+    const projectId = 'projectId' in parsed.data ? (parsed.data.projectId as string | null | undefined) : undefined;
+    if (projectId) {
+      const owned = await db.project.findFirst({ where: { id: projectId, userId: user.id }, select: { id: true } });
+      if (!owned) return jsonError('That project was not found in your account.', 404);
+    }
+    const headerKey = request.headers.get('idempotency-key');
+    const requestKey = (headerKey && /^[a-zA-Z0-9._:-]{8,120}$/.test(headerKey)) ? headerKey : randomUUID();
+    const reservation = await reserveGeneration(user.id, requestKey, tool);
+    if (reservation.mode === 'limit') return Response.json({ error: `You've used your ${reservation.limit} ${reservation.plan === 'PRO' ? 'Pro' : 'Free'} AI generations.`, code: 'QUOTA_EXCEEDED' }, { status: 402 });
+    if (reservation.mode === 'pending') return jsonError('This generation is already running. Wait a moment before retrying.', 409, 'REQUEST_PENDING');
+    if (reservation.mode === 'cached') {
+      const cached = reservation.response as { result?: string; contentId?: string } | null;
+      const quota = await getPlanContext(user.id);
+      return Response.json({ ok: true, result: cached?.result || '', contentId: cached?.contentId, quota, cached: true });
+    }
+
+    try {
+      const result = await generateWithGroq(tool, input as unknown as Record<string, unknown>);
+      const title = `${TOOL_DETAILS[tool].title} Â· ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+      const content = await db.$transaction(async (tx) => {
+        const saved = await tx.generatedContent.create({ data: { userId: user.id, projectId: projectId || null, type: tool, title, body: result, metadata: input as Prisma.InputJsonValue } });
+        const responsePayload = { result, contentId: saved.id };
+        await tx.usageRecord.update({ where: { userId_requestKey: { userId: user.id, requestKey } }, data: { status: 'COMPLETE', response: responsePayload, completedAt: new Date() } });
+        return saved;
+      }, { isolationLevel: 'Serializable' });
+      const quota = await getPlanContext(user.id);
+      return Response.json({ ok: true, result, contentId: content.id, quota, cached: false });
+    } catch (error) {
+      await failGeneration(user.id, requestKey).catch(() => undefined);
+      if (error instanceof Error && error.message === 'GROQ_NOT_CONFIGURED') return jsonError('AI generation is not configured yet. Add GROQ_API_KEY to the server environment.', 503, 'AI_NOT_CONFIGURED');
+      if (error instanceof Error && error.message === 'EMPTY_AI_RESPONSE') return jsonError('The AI service returned an empty response. Please try again.', 502);
+      console.error('ai_generation_failed', error instanceof Error ? error.message : 'unknown');
+      return jsonError('AI generation failed. Your quota was not consumed; please try again.', 502, 'AI_FAILED');
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === 'REQUEST_TOO_LARGE') return jsonError('Request is too large.', 413);
+    if (error instanceof Error && error.message === 'INVALID_JSON') return jsonError('Please submit valid form data.', 400);
+    if (error instanceof Error && error.message.includes('P2034')) return jsonError('Another generation is being processed. Try again shortly.', 409);
+    console.error('ai_request_failed', error instanceof Error ? error.message : 'unknown');
+    return jsonError('Unable to process the request right now.', 503);
+  }
+}
+
+
+========== api\auth\callback.ts ==========
+import { finishWhopOAuth } from '../../lib/whop-oauth';
+
+export const runtime = 'nodejs';
+export const maxDuration = 30;
+export async function GET(request: Request) {
+  return finishWhopOAuth(request);
+}
+
+
+========== api\auth\login.ts ==========
+import { createHash } from 'node:crypto';
+import bcrypt from 'bcryptjs';
+import { loginSchema } from '../../lib/validators';
+import { assertSameOrigin, getClientIp, jsonError, readJsonLimited } from '../../lib/http';
+import { consumeRateLimit } from '../../lib/rate-limit';
+import { db } from '../../lib/db';
+import { createSession } from '../../lib/auth';
+
+export const runtime = 'nodejs';
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  try {
+    const parsed = loginSchema.safeParse(await readJsonLimited(request, 8_000));
+    if (!parsed.success) return jsonError('Enter a valid email and password.', 400);
+    const { email, password } = parsed.data;
+    const emailKey = createHash('sha256').update(email).digest('hex').slice(0, 32);
+    const allowed = await consumeRateLimit(`login:${getClientIp(request)}:${emailKey}`, 8, 15 * 60 * 1000);
+    if (!allowed) return jsonError('Too many sign-in attempts. Please wait and try again.', 429);
+    const user = await db.user.findUnique({ where: { email }, select: { id: true, email: true, name: true, passwordHash: true, createdAt: true } });
+    const matches = user?.passwordHash ? await bcrypt.compare(password, user.passwordHash) : false;
+    if (!user || !matches) return jsonError('Email or password is incorrect.', 401);
+    const cookie = await createSession(user.id);
+    return Response.json({ user: { id: user.id, email: user.email, name: user.name, createdAt: user.createdAt } }, { headers: { "Set-Cookie": cookie } });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    console.error('login_failed', error instanceof Error ? error.message : 'unknown');
+    return jsonError('Sign-in is temporarily unavailable. Please try again.', 503);
+  }
+}
+
+
+========== api\auth\logout.ts ==========
+import { deleteSession } from '../../lib/auth';
+import { assertSameOrigin, jsonError } from '../../lib/http';
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  try { const cookie = await deleteSession(request); return Response.json({ ok: true }, { headers: { "Set-Cookie": cookie } }); }
+  catch { return jsonError('Unable to end the session. Please refresh and try again.', 503); }
+}
+
+
+========== api\auth\me.ts ==========
+import { getCurrentUser } from '../../lib/auth';
+import { getPlanContext } from '../../lib/usage';
+export async function GET(request: Request) {
+  const user = await getCurrentUser(request);
+  if (!user) return Response.json({ user: null }, { status: 401 });
+  const usage = await getPlanContext(user.id);
+  return Response.json({ user, usage });
+}
+
+
+========== api\auth\register.ts ==========
+import bcrypt from 'bcryptjs';
+import { registrationSchema } from '../../lib/validators';
+import { assertSameOrigin, getClientIp, jsonError, readJsonLimited } from '../../lib/http';
+import { consumeRateLimit } from '../../lib/rate-limit';
+import { db } from '../../lib/db';
+import { createSession } from '../../lib/auth';
+
+export const runtime = 'nodejs';
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  try {
+    if (!(await consumeRateLimit(`register:${getClientIp(request)}`, 6, 60 * 60 * 1000))) return jsonError('Too many account attempts. Please try again later.', 429);
+    const parsed = registrationSchema.safeParse(await readJsonLimited(request, 8_000));
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check the form fields.', 400, 'VALIDATION_ERROR');
+    const { name, email, password } = parsed.data;
+    const passwordHash = await bcrypt.hash(password, 12);
+    const user = await db.user.create({ data: { name, email, passwordHash, subscription: { create: { plan: 'FREE', status: 'FREE' } } }, select: { id: true, email: true, name: true, createdAt: true } });
+    const cookie = await createSession(user.id);
+    return Response.json({ user }, { status: 201, headers: { "Set-Cookie": cookie } });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'P2002') return jsonError('An account with this email already exists.', 409);
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError(error.message === 'REQUEST_TOO_LARGE' ? 'Request is too large.' : 'Please submit valid form data.', 400);
+    console.error('register_failed', error instanceof Error ? error.message : 'unknown');
+    return jsonError('Account creation is temporarily unavailable. Please check the database configuration and try again.', 503);
+  }
+}
+
+
+========== api\auth\whop.ts ==========
+import { startWhopOAuth } from '../../lib/whop-oauth';
+
+export const runtime = 'nodejs';
+export async function GET(request: Request) {
+  return startWhopOAuth(request);
+}
+
+
+========== api\billing\refresh.ts ==========
+import { z } from 'zod';
+import { requireApiUser } from '../../lib/auth';
+import { fetchWhopMembership, membershipMatchesConfiguredProduct, syncMembershipForEmail } from '../../lib/billing';
+import { getPlanContext } from '../../lib/usage';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../../lib/http';
+import { consumeRateLimit } from '../../lib/rate-limit';
+
+const schema = z.object({ membershipId: z.string().trim().min(8).max(160) });
+export const runtime = 'nodejs';
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  if (!(await consumeRateLimit(`billing-refresh:${user.id}`, 8, 60 * 60 * 1000))) return jsonError('Too many verification attempts. Please try again later.', 429);
+  try {
+    const parsed = schema.safeParse(await readJsonLimited(request, 3_000));
+    if (!parsed.success) return jsonError('Enter a valid Whop membership ID.', 400);
+    const membership = await fetchWhopMembership(parsed.data.membershipId);
+    if (membership.user?.email?.toLowerCase() !== user.email.toLowerCase()) return jsonError('That membership does not match your signed-in account email.', 403);
+    if (!membershipMatchesConfiguredProduct(membership)) return jsonError('This membership does not match the configured LaunchPilot Pro product and plan.', 403);
+    const synced = await syncMembershipForEmail(membership);
+    if (!synced) return jsonError('Membership was verified but could not be linked to this account. Confirm that the Whop account email matches your LaunchPilot account.', 403);
+    const usage = await getPlanContext(user.id);
+    return Response.json({ ok: true, usage, message: `Membership checked with Whop. Current plan: ${usage.plan}.` });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'WHOP_NOT_CONFIGURED') return jsonError('Whop verification is not configured yet. Add the server-side Whop API key and product/plan IDs.', 503, 'WHOP_NOT_CONFIGURED');
+    if (error instanceof Error && error.message === 'MEMBERSHIP_NOT_FOUND') return jsonError('Whop did not find that membership ID.', 404);
+    if (error instanceof Error && error.message === 'INVALID_MEMBERSHIP_ID') return jsonError('That membership ID format is not valid.', 400);
+    return jsonError('Could not verify membership with Whop right now. No access status was changed.', 502);
+  }
+}
+
+
+========== api\competitors.ts ==========
+import { competitorSchema } from '../lib/validators';
+import { getCurrentUser, requireApiUser } from '../lib/auth';
+import { db } from '../lib/db';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../lib/http';
+
+export async function GET(request: Request) {
+  const user = await getCurrentUser(request); if (!user) return jsonError('Please sign in to view competitor notes.', 401);
+  const competitors = await db.competitorRecord.findMany({ where: { userId: user.id }, orderBy: { researchedAt: 'desc' }, include: { project: { select: { id: true, title: true } } } });
+  return Response.json({ competitors });
+}
+
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  try {
+    const parsed = competitorSchema.safeParse(await readJsonLimited(request, 12_000));
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check the competitor fields.', 400);
+    const data = parsed.data;
+    if (data.url && !/^https?:\/\//i.test(data.url)) return jsonError('Use a website URL beginning with http:// or https://.', 400);
+    if (data.projectId) {
+      const project = await db.project.findFirst({ where: { id: data.projectId, userId: user.id }, select: { id: true } });
+      if (!project) return jsonError('Project not found in your account.', 404);
+    }
+    const competitor = await db.competitorRecord.create({ data: { userId: user.id, projectId: data.projectId || null, name: data.name, url: data.url || null, observations: data.observations || null, pricingNotes: data.pricingNotes || null, researchedAt: data.researchedAt ? new Date(data.researchedAt) : new Date() } });
+    return Response.json({ competitor }, { status: 201 });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    return jsonError('Unable to save competitor notes.', 503);
+  }
+}
+
+
+========== api\competitors\[id].ts ==========
+import { competitorSchema } from '../../lib/validators';
+import { requireApiUser } from '../../lib/auth';
+import { db } from '../../lib/db';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../../lib/http';
+
+export async function PATCH(request: Request, context?: { params: Promise<{ id: string }> }) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  const id = context ? (await context.params).id : (new URL(request.url).searchParams.get('__id') || new URL(request.url).pathname.split('/').filter(Boolean).pop() || '');
+  try {
+    const parsed = competitorSchema.partial().safeParse(await readJsonLimited(request, 12_000));
+    if (!parsed.success || !Object.keys(parsed.data || {}).length) return jsonError('Please check the competitor fields.', 400);
+    const existing = await db.competitorRecord.findFirst({ where: { id, userId: user.id }, select: { id: true } });
+    if (!existing) return jsonError('Competitor note not found.', 404);
+    const data = parsed.data;
+    if (data.url && !/^https?:\/\//i.test(data.url)) return jsonError('Use a website URL beginning with http:// or https://.', 400);
+    if (data.projectId) {
+      const project = await db.project.findFirst({ where: { id: data.projectId, userId: user.id }, select: { id: true } });
+      if (!project) return jsonError('Project not found in your account.', 404);
+    }
+    const competitor = await db.competitorRecord.update({ where: { id }, data: {
+      ...(data.name !== undefined ? { name: data.name } : {}), ...(data.url !== undefined ? { url: data.url || null } : {}),
+      ...(data.observations !== undefined ? { observations: data.observations || null } : {}), ...(data.pricingNotes !== undefined ? { pricingNotes: data.pricingNotes || null } : {}),
+      ...(data.researchedAt !== undefined ? { researchedAt: new Date(data.researchedAt) } : {}), ...(data.projectId !== undefined ? { projectId: data.projectId } : {})
+    } });
+    return Response.json({ competitor });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    return jsonError('Unable to update competitor notes.', 503);
+  }
+}
+
+export async function DELETE(request: Request, context?: { params: Promise<{ id: string }> }) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  const id = context ? (await context.params).id : (new URL(request.url).searchParams.get('__id') || new URL(request.url).pathname.split('/').filter(Boolean).pop() || '');
+  const result = await db.competitorRecord.deleteMany({ where: { id, userId: user.id } });
+  return result.count ? Response.json({ ok: true }) : jsonError('Competitor note not found.', 404);
+}
+
+
+========== api\contact.ts ==========
+import { contactSchema } from '../lib/validators';
+import { getCurrentUser } from '../lib/auth';
+import { db } from '../lib/db';
+import { assertSameOrigin, getClientIp, jsonError, readJsonLimited } from '../lib/http';
+import { consumeRateLimit } from '../lib/rate-limit';
+
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  try {
+    if (!(await consumeRateLimit(`contact:${getClientIp(request)}`, 5, 60 * 60 * 1000))) return jsonError('Too many messages were submitted. Please try again later.', 429);
+    const parsed = contactSchema.safeParse(await readJsonLimited(request, 10_000));
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check the form fields.', 400);
+    const user = await getCurrentUser(request);
+    await db.contactMessage.create({ data: { ...parsed.data, email: parsed.data.email.toLowerCase(), userId: user?.id || null } });
+    return Response.json({ ok: true, message: 'Your message was saved. Email delivery is not configured, so it has not been emailed.' }, { status: 201 });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    return jsonError('Contact form storage is unavailable. Please try again later.', 503);
+  }
+}
+
+
+========== api\content\[id].ts ==========
+import { z } from 'zod';
+import { requireApiUser } from '../../lib/auth';
+import { db } from '../../lib/db';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../../lib/http';
+
+const schema = z.object({ title: z.string().trim().min(1).max(180).optional(), body: z.string().max(80_000).optional() }).refine((v) => Object.keys(v).length > 0);
+export async function PATCH(request: Request, context?: { params: Promise<{ id: string }> }) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  const id = context ? (await context.params).id : (new URL(request.url).searchParams.get('__id') || new URL(request.url).pathname.split('/').filter(Boolean).pop() || '');
+  try {
+    const parsed = schema.safeParse(await readJsonLimited(request, 90_000));
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check the output fields.', 400);
+    const existing = await db.generatedContent.findFirst({ where: { id, userId: user.id }, select: { id: true } });
+    if (!existing) return jsonError('Saved output not found.', 404);
+    const content = await db.generatedContent.update({ where: { id }, data: parsed.data });
+    return Response.json({ content });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    return jsonError('Unable to update this output.', 503);
+  }
+}
+
+export async function DELETE(request: Request, context?: { params: Promise<{ id: string }> }) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  const id = context ? (await context.params).id : (new URL(request.url).searchParams.get('__id') || new URL(request.url).pathname.split('/').filter(Boolean).pop() || '');
+  const deleted = await db.generatedContent.deleteMany({ where: { id, userId: user.id } });
+  return deleted.count ? Response.json({ ok: true }) : jsonError('Saved output not found.', 404);
+}
+
+
+========== api\projects.ts ==========
+import { projectCreateSchema } from '../lib/validators';
+import { requireApiUser, getCurrentUser } from '../lib/auth';
+import { db } from '../lib/db';
+import { getPlanContext } from '../lib/usage';
+import { canCreateProject } from '../lib/policy';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../lib/http';
+
+export const runtime = 'nodejs';
+export async function GET(request: Request) {
+  const user = await getCurrentUser(request);
+  if (!user) return jsonError('Please sign in to view projects.', 401);
+  const [projects, outputs] = await Promise.all([
+    db.project.findMany({ where: { userId: user.id }, orderBy: { updatedAt: 'desc' }, include: { _count: { select: { generatedContent: true, tasks: true } } } }),
+    db.generatedContent.findMany({ where: { userId: user.id }, orderBy: { createdAt: 'desc' }, take: 50, select: { id: true, title: true, type: true, body: true, projectId: true, createdAt: true } })
+  ]);
+  return Response.json({ projects, outputs });
+}
+
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  try {
+    const parsed = projectCreateSchema.safeParse(await readJsonLimited(request, 5_000));
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check the project fields.', 400);
+    const usage = await getPlanContext(user.id);
+    const count = await db.project.count({ where: { userId: user.id } });
+    const limit = usage.plan === 'PRO' ? 100 : 3;
+    if (!canCreateProject(usage.plan, count)) return Response.json({ error: `Your ${usage.plan === 'PRO' ? 'Pro' : 'Free'} plan allows ${limit} saved projects.`, code: 'PROJECT_LIMIT' }, { status: 402 });
+    const project = await db.project.create({ data: { userId: user.id, title: parsed.data.title, description: parsed.data.description || null } });
+    return Response.json({ project }, { status: 201 });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    return jsonError('Unable to save the project right now.', 503);
+  }
+}
+
+
+========== api\projects\[id].ts ==========
+import { projectUpdateSchema } from '../../lib/validators';
+import { requireApiUser } from '../../lib/auth';
+import { db } from '../../lib/db';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../../lib/http';
+
+export async function PATCH(request: Request, context?: { params: Promise<{ id: string }> }) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  const id = context ? (await context.params).id : (new URL(request.url).searchParams.get('__id') || new URL(request.url).pathname.split('/').filter(Boolean).pop() || '');
+  try {
+    const parsed = projectUpdateSchema.safeParse(await readJsonLimited(request, 5_000));
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check the project fields.', 400);
+    const owned = await db.project.findFirst({ where: { id, userId: user.id }, select: { id: true } });
+    if (!owned) return jsonError('Project not found.', 404);
+    const project = await db.project.update({ where: { id }, data: { ...(parsed.data.title ? { title: parsed.data.title } : {}), ...(parsed.data.description !== undefined ? { description: parsed.data.description || null } : {}) } });
+    return Response.json({ project });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    return jsonError('Unable to update this project.', 503);
+  }
+}
+
+export async function DELETE(request: Request, context?: { params: Promise<{ id: string }> }) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  const id = context ? (await context.params).id : (new URL(request.url).searchParams.get('__id') || new URL(request.url).pathname.split('/').filter(Boolean).pop() || '');
+  const deleted = await db.project.deleteMany({ where: { id, userId: user.id } });
+  if (!deleted.count) return jsonError('Project not found.', 404);
+  return Response.json({ ok: true });
+}
+
+
+========== api\settings.ts ==========
+import { z } from 'zod';
+import { requireApiUser } from '../lib/auth';
+import { db } from '../lib/db';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../lib/http';
+
+const schema = z.object({ name: z.string().trim().min(1).max(80) });
+export async function PATCH(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  try {
+    const parsed = schema.safeParse(await readJsonLimited(request, 3_000));
+    if (!parsed.success) return jsonError('Name must be between 1 and 80 characters.', 400);
+    const updated = await db.user.update({ where: { id: user.id }, data: { name: parsed.data.name }, select: { id: true, name: true, email: true } });
+    return Response.json({ user: updated });
+  } catch { return jsonError('Unable to update settings.', 503); }
+}
+
+
+========== api\tasks.ts ==========
+import { taskCreateSchema } from '../lib/validators';
+import { getCurrentUser, requireApiUser } from '../lib/auth';
+import { db } from '../lib/db';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../lib/http';
+
+export async function GET(request: Request) {
+  const user = await getCurrentUser(request); if (!user) return jsonError('Please sign in to view launch tasks.', 401);
+  const url = new URL(request.url); const status = url.searchParams.get('status');
+  const tasks = await db.launchTask.findMany({ where: { userId: user.id, ...(status && ['todo', 'in-progress', 'done'].includes(status) ? { status } : {}) }, orderBy: [{ dueDate: 'asc' }, { createdAt: 'desc' }], include: { project: { select: { id: true, title: true } } } });
+  return Response.json({ tasks });
+}
+
+export async function POST(request: Request) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  try {
+    const parsed = taskCreateSchema.safeParse(await readJsonLimited(request, 7_000));
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check the task fields.', 400);
+    if (parsed.data.projectId) {
+      const owned = await db.project.findFirst({ where: { id: parsed.data.projectId, userId: user.id }, select: { id: true } });
+      if (!owned) return jsonError('Project not found in your account.', 404);
+    }
+    const task = await db.launchTask.create({ data: { userId: user.id, title: parsed.data.title, description: parsed.data.description || null, dueDate: parsed.data.dueDate ? new Date(parsed.data.dueDate) : null, priority: parsed.data.priority, status: parsed.data.status, projectId: parsed.data.projectId || null } });
+    return Response.json({ task }, { status: 201 });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    return jsonError('Unable to save this task.', 503);
+  }
+}
+
+
+========== api\tasks\[id].ts ==========
+import { taskUpdateSchema } from '../../lib/validators';
+import { requireApiUser } from '../../lib/auth';
+import { db } from '../../lib/db';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../../lib/http';
+
+export async function PATCH(request: Request, context?: { params: Promise<{ id: string }> }) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  const id = context ? (await context.params).id : (new URL(request.url).searchParams.get('__id') || new URL(request.url).pathname.split('/').filter(Boolean).pop() || '');
+  try {
+    const parsed = taskUpdateSchema.safeParse(await readJsonLimited(request, 7_000));
+    if (!parsed.success) return jsonError(parsed.error.issues[0]?.message || 'Please check the task fields.', 400);
+    const existing = await db.launchTask.findFirst({ where: { id, userId: user.id }, select: { id: true } });
+    if (!existing) return jsonError('Task not found.', 404);
+    if (parsed.data.projectId) {
+      const project = await db.project.findFirst({ where: { id: parsed.data.projectId, userId: user.id }, select: { id: true } });
+      if (!project) return jsonError('Project not found in your account.', 404);
+    }
+    const data = parsed.data;
+    const task = await db.launchTask.update({ where: { id }, data: {
+      ...(data.title !== undefined ? { title: data.title } : {}),
+      ...(data.description !== undefined ? { description: data.description || null } : {}),
+      ...(data.dueDate !== undefined ? { dueDate: data.dueDate ? new Date(data.dueDate) : null } : {}),
+      ...(data.priority !== undefined ? { priority: data.priority } : {}),
+      ...(data.status !== undefined ? { status: data.status } : {}),
+      ...(data.projectId !== undefined ? { projectId: data.projectId } : {})
+    } });
+    return Response.json({ task });
+  } catch (error) {
+    if (error instanceof Error && ['REQUEST_TOO_LARGE', 'INVALID_JSON'].includes(error.message)) return jsonError('Please submit valid form data.', 400);
+    return jsonError('Unable to update this task.', 503);
+  }
+}
+
+export async function DELETE(request: Request, context?: { params: Promise<{ id: string }> }) {
+  if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);
+  const { user, response } = await requireApiUser(request); if (!user) return response;
+  const id = context ? (await context.params).id : (new URL(request.url).searchParams.get('__id') || new URL(request.url).pathname.split('/').filter(Boolean).pop() || '');
+  const result = await db.launchTask.deleteMany({ where: { id, userId: user.id } });
+  return result.count ? Response.json({ ok: true }) : jsonError('Task not found.', 404);
+}
+
+
+========== api\webhooks\whop.ts ==========
+import { createHash } from 'node:crypto';
+import { db } from '../../lib/db';
+import { claimWebhookEvent, markWebhookEventProcessed, releaseUnprocessedWebhookEvent } from '../../lib/webhook-events';
+import { fetchWhopMembership, syncMembershipForEmail, verifyWhopWebhook } from '../../lib/billing';
+import { jsonError } from '../../lib/http';
+
+export const runtime = 'nodejs';
+export const maxDuration = 30;
+
+function recordValue(record: Record<string, unknown> | undefined, key: string): unknown {
+  return record && typeof record === 'object' ? record[key] : undefined;
+}
+
+export async function POST(request: Request) {
+  const rawBody = await request.text();
+  if (new TextEncoder().encode(rawBody).byteLength > 100_000) return jsonError('Webhook payload is too large.', 413);
+  if (!verifyWhopWebhook(rawBody, request.headers)) return jsonError('Webhook signature could not be verified.', 401);
+  let body: unknown;
+  try { body = JSON.parse(rawBody); } catch { return jsonError('Webhook payload is not valid JSON.', 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonError('Webhook payload shape is not valid.', 400);
+  const payload = body as Record<string, unknown>;
+  const data = (payload.data && typeof payload.data === 'object' ? payload.data : payload.resource && typeof payload.resource === 'object' ? payload.resource : payload) as Record<string, unknown>;
+  const eventType = String(payload.type || payload.event_type || payload.event || '').slice(0, 120);
+  const eventId = request.headers.get('webhook-id') || String(payload.id || payload.event_id || '') || createHash('sha256').update(rawBody).digest('hex');
+  const membershipId = String(
+    data.id && String(data.id).startsWith('mem_') ? data.id :
+    recordValue(data.membership as Record<string, unknown> | undefined, 'id') ||
+    recordValue(data, 'membership_id') ||
+    recordValue(payload.membership as Record<string, unknown> | undefined, 'id') ||
+    payload.membership_id || ''
+  );
+  try {
+    const claim = await claimWebhookEvent(eventId, eventType || 'unknown', payload);
+    if (claim === 'duplicate') return Response.json({ ok: true, duplicate: true });
+
+    const membershipSignal = eventType.startsWith('membership.') || eventType === 'payment.succeeded' || eventType === 'payment.failed';
+    if (membershipSignal && membershipId.startsWith('mem_')) {
+      try {
+        const membership = await fetchWhopMembership(membershipId);
+        const linked = await syncMembershipForEmail(membership);
+        if (!linked) {
+          // It may be another product's event. It is valid but must not affect LaunchPilot access.
+        }
+      } catch (error) {
+        if (eventType === 'membership.deactivated' && (error instanceof Error && error.message === 'MEMBERSHIP_NOT_FOUND')) {
+          await db.subscription.updateMany({ where: { whopMembershipId: membershipId }, data: { plan: 'FREE', status: 'INACTIVE', lastVerifiedAt: new Date() } });
+        } else {
+          await releaseUnprocessedWebhookEvent(eventId).catch(() => undefined);
+          return jsonError('Membership verification was temporarily unavailable. Whop can retry this event.', 503);
+        }
+      }
+    }
+    await markWebhookEventProcessed(eventId);
+    return Response.json({ ok: true });
+  } catch (error) {
+    console.error('whop_webhook_failed', error instanceof Error ? error.message : 'unknown');
+    return jsonError('Webhook processing failed. Whop can retry this event.', 503);
+  }
+}
+
+
+========== FRONTEND API REFERENCES ==========
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:78: async function api(path, options={}){ const headers={...(options.body?{'Content-Type':'application/json'}:{}),...(options.headers||{})};let response;try{response=await fetch(path,{credentials:'same-origin',...options,headers});}catch{throw new Error('Could not connect to the server. Check the deployment and try again.');}let payload={};const text=await response.text();try{payload=text?JSON.parse(text):{};}catch{payload={error:text||'Unexpected server response.'};}if(!response.ok){const err=new Error(payload.error||`Request failed (${response.status}).`);err.status=response.status;err.code=payload.code;throw err;}return payload;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:94: function authPage(register){return `${publicNav()}<main class="container"><section class="form-wrap"><div class="form-card"><div style="text-align:center;margin-bottom:24px">${logo()}<h2 style="font-size:27px;margin:22px 0 7px">${register?'Create your workspace':'Welcome back'}</h2><p style="font-size:13px;margin:0">${register?'Start turning your idea into a launch plan.':'Sign in to continue your launch work.'}</p></div>${whopAuthNotice()}<a class="btn btn-secondary" style="width:100%" href="/api/auth/whop" target="_top">Continue with Whop ${icon('arrow',15)}</a><div style="display:flex;align-items:center;gap:12px;margin:18px 0;color:var(--muted);font-size:12px"><span style="height:1px;background:var(--line);flex:1"></span>or use email and password<span style="height:1px;background:var(--line);flex:1"></span></div><form id="auth-form" data-mode="${register?'register':'login'}">${register?`<div class="field"><label for="auth-name">Full name</label><input id="auth-name" name="name" required maxlength="80" autocomplete="name"></div>`:''}<div class="field"><label for="auth-email">Email address</label><input id="auth-email" name="email" type="email" required maxlength="254" autocomplete="email"></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" required minlength="${register?12:1}" maxlength="128" autocomplete="${register?'new-password':'current-password'}">${register?'<span class="hint">Use at least 12 characters.</span>':''}</div><p id="auth-error" class="form-error"></p><button class="btn btn-primary" style="width:100%" type="submit">${register?'Create account':'Sign in'} ${icon('arrow',15)}</button></form><p style="text-align:center;font-size:12px;margin:19px 0 0">${register?'Already have an account? <a class="text-link" href="#/login">Sign in</a>':'New to LaunchPilot AI? <a class="text-link" href="#/register">Create an account</a>'}</p><p class="small muted" style="text-align:center;margin:18px 0 0">Email/password and Whop sign-in share the same workspace when a verified email can be linked safely.</p></div></section></main>${footer()}`;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:115: async function getMe(silent=true){try{const p=await api('/api/auth/me');state.user=p.user;state.usage=p.usage;state.loaded=true;return true;}catch(e){state.user=null;state.usage=null;state.loaded=true;if(e.status!==401&& !silent)toast(e.message,'error');return false;}}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:116: async function refreshData(){if(!state.user)return;state.dataError=null;try{const results=await Promise.allSettled([api('/api/auth/me'),api('/api/projects'),api('/api/tasks'),api('/api/competitors')]);if(results[0].status==='fulfilled'){state.user=results[0].value.user;state.usage=results[0].value.usage;}else throw results[0].reason;if(results[1].status==='fulfilled'){state.projects=results[1].value.projects||[];state.outputs=results[1].value.outputs||[];}else if(results[1].reason.status!==401)state.dataError=results[1].reason.message;if(results[2].status==='fulfilled')state.tasks=results[2].value.tasks||[];else if(results[2].reason.status!==401)state.dataError=state.dataError||results[2].reason.message;if(results[3].status==='fulfilled')state.competitors=results[3].value.competitors||[];else if(results[3].reason.status!==401)state.dataError=state.dataError||results[3].reason.message;}catch(e){state.dataError=e.message;if(e.status===401){state.user=null;go('/login');return;}}}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:121: if(f.id==='auth-form'){e.preventDefault();const btn=f.querySelector('button[type="submit"]');btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Please wait';const d=formValues(f);try{const result=await api(f.dataset.mode==='register'?'/api/auth/register':'/api/auth/login',{method:'POST',body:JSON.stringify(d)});state.user=result.user;await getMe(true);toast(f.dataset.mode==='register'?'Account created.':'Signed in successfully.','success');go('/dashboard');}catch(err){showFormError('auth-error',err.message);}finally{btn.disabled=false;btn.textContent=f.dataset.mode==='register'?'Create account':'Sign in';}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:122: if(f.id==='contact-form'){e.preventDefault();const btn=f.querySelector('button[type="submit"]');btn.disabled=true;try{const d=formValues(f);const result=await api('/api/contact',{method:'POST',body:JSON.stringify(d)});toast(result.message||'Message saved.','success');f.reset();}catch(err){showFormError('contact-error',err.message);}finally{btn.disabled=false;}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:123: if(f.id==='ai-form'){e.preventDefault();const btn=f.querySelector('button[type="submit"]');btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Generating…';const d=formValues(f);const tool=f.dataset.tool;const projectId=d.projectId||null;delete d.projectId;try{const idempotency=window.crypto?.randomUUID?crypto.randomUUID():`lp-${Date.now()}-${Math.random().toString(36).slice(2)}`;const result=await api('/api/ai/generate',{method:'POST',headers:{'Idempotency-Key':idempotency},body:JSON.stringify({tool,input:d,projectId})});state.toolResult={tool,title:`${TOOLS[tool].title} · ${new Date().toLocaleDateString()}`,contentId:result.contentId,result:result.result};state.usage=result.quota||state.usage;await refreshData();root.innerHTML=dashboardShell(contentView(route()));toast('Draft generated and saved.','success');}catch(err){showFormError('ai-error',err.message);if(err.status===402||err.code==='QUOTA_EXCEEDED')toast(err.message,'error');if(err.status===403&&err.code==='PRO_REQUIRED')toast('This tool requires an active Pro membership.','error');}finally{const current=document.querySelector('#ai-form button[type="submit"]');if(current){current.disabled=TOOLS[tool].pro&&state.usage?.plan!=='PRO';current.innerHTML=icon('spark',15)+' Generate '+esc(TOOLS[tool].title);}}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:124: if(f.id==='task-form'){e.preventDefault();const d=formValues(f);const id=f.dataset.id;const data={...d,dueDate:d.dueDate?new Date(`${d.dueDate}T12:00:00.000Z`).toISOString():null,projectId:d.projectId||null};try{await api(id?`/api/tasks/${encodeURIComponent(id)}`:'/api/tasks',{method:id?'PATCH':'POST',body:JSON.stringify(data)});await refreshData();root.innerHTML=dashboardShell(calendarPage());toast(id?'Task updated.':'Task created.','success');}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:125: if(f.id==='competitor-form'){e.preventDefault();const d=formValues(f);const id=f.dataset.id;const data={...d,url:d.url||'',projectId:d.projectId||null,researchedAt:d.researchedAt?new Date(`${d.researchedAt}T12:00:00.000Z`).toISOString():new Date().toISOString()};try{await api(id?`/api/competitors/${encodeURIComponent(id)}`:'/api/competitors',{method:id?'PATCH':'POST',body:JSON.stringify(data)});await refreshData();root.innerHTML=dashboardShell(competitorsPage());toast(id?'Research note updated.':'Research note saved.','success');}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:126: if(f.id==='billing-form'){e.preventDefault();const btn=f.querySelector('button[type="submit"]');btn.disabled=true;try{const data=formValues(f);const result=await api('/api/billing/refresh',{method:'POST',body:JSON.stringify(data)});state.usage=result.usage||state.usage;await refreshData();root.innerHTML=dashboardShell(billingPage());toast(result.message||'Membership refreshed.','success');}catch(err){showFormError('billing-error',err.message);}finally{btn.disabled=false;}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:127: if(f.id==='settings-form'){e.preventDefault();try{const d=formValues(f);const result=await api('/api/settings',{method:'PATCH',body:JSON.stringify(d)});state.user={...state.user,...result.user};root.innerHTML=dashboardShell(settingsPage());toast('Profile updated.','success');}catch(err){showFormError('settings-error',err.message);}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:133: if(action==='logout'){try{await api('/api/auth/logout',{method:'POST',body:JSON.stringify({})});}catch(err){toast(err.message,'error');}state.user=null;state.usage=null;go('/');toast('You have been signed out.','success');return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:134: if(action==='create-project'){const title=prompt('Project title');if(!title||!title.trim())return;const description=prompt('Short project description (optional)')||'';try{await api('/api/projects',{method:'POST',body:JSON.stringify({title:title.trim(),description:description.trim()})});await refreshData();root.innerHTML=dashboardShell(contentView(route()));toast('Project created.','success');}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:135: if(action==='rename-project'){const p=state.projects.find(x=>x.id===id);if(!p)return;const title=prompt('New project title',p.title);if(!title||!title.trim())return;try{await api(`/api/projects/${encodeURIComponent(id)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});await refreshData();root.innerHTML=dashboardShell(projectsPage());toast('Project renamed.','success');}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:136: if(action==='delete-project'){if(!confirm('Delete this project? Associated tasks and generated content may also be removed according to database relations.'))return;try{await api(`/api/projects/${encodeURIComponent(id)}`,{method:'DELETE'});await refreshData();root.innerHTML=dashboardShell(projectsPage());toast('Project deleted.','success');}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:140: if(action==='delete-task'){if(!confirm('Delete this task?'))return;try{await api(`/api/tasks/${encodeURIComponent(id)}`,{method:'DELETE'});await refreshData();root.innerHTML=dashboardShell(calendarPage());toast('Task deleted.','success');}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:141: if(action==='toggle-task'){const t=state.tasks.find(x=>x.id===id);if(!t)return;try{await api(`/api/tasks/${encodeURIComponent(id)}`,{method:'PATCH',body:JSON.stringify({status:t.status==='done'?'todo':'done'})});await refreshData();root.innerHTML=dashboardShell(contentView(route()));}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:144: if(action==='delete-competitor'){if(!confirm('Delete this research note?'))return;try{await api(`/api/competitors/${encodeURIComponent(id)}`,{method:'DELETE'});await refreshData();root.innerHTML=dashboardShell(competitorsPage());toast('Research note deleted.','success');}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:146: if(action==='save-output'){const editor=document.getElementById('result-editor');if(!editor)return;try{const title=document.getElementById('result-title')?.value?.trim()||'Generated draft';await api(`/api/content/${encodeURIComponent(id)}`,{method:'PATCH',body:JSON.stringify({title,body:editor.value})});state.toolResult={...(state.toolResult||{}),title,contentId:id,result:editor.value};await refreshData();toast('Draft changes saved.','success');}catch(err){toast(err.message,'error');}return;}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:149: if(action==='delete-output'){if(!confirm('Delete this saved output?'))return;try{await api(`/api/content/${encodeURIComponent(id)}`,{method:'DELETE'});await refreshData();root.innerHTML=dashboardShell(projectsPage());toast('Output deleted.','success');}catch(err){toast(err.message,'error');}}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\index.html:151: async function handleChange(e){const t=e.target;if(t.id==='task-filter'){state.activeFilter=t.value;root.innerHTML=dashboardShell(calendarPage());return;}if(t.matches('[data-action="task-check"]')){const task=state.tasks.find(x=>x.id===t.dataset.id);if(!task)return;try{await api(`/api/tasks/${encodeURIComponent(task.id)}`,{method:'PATCH',body:JSON.stringify({status:t.checked?'done':'todo'})});await refreshData();root.innerHTML=dashboardShell(calendarPage());}catch(err){t.checked=!t.checked;toast(err.message,'error');}}}
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\lib\billing.ts:45: const response = await fetch(`https://api.whop.com/api/v1/memberships/${encodeURIComponent(membershipId)}`, {
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\lib\whop-oauth.ts:123: return new URL('/api/auth/callback', `${base}/`).toString();
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\lib\whop-oauth.ts:155: const response = await fetch(url, {
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\lib\whop-oauth.ts:169: const response = await fetch(`${whopApiBase()}/oauth/userinfo`, {
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\ai-route.test.ts:12: import { POST } from '@/api/ai/generate';
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\ai-route.test.ts:23: const request = new Request('http://localhost/api/ai/generate', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ tool: 'sales-page-generator', input: { product: 'A template', audience: 'Freelancers', benefits: 'Save time', tone: 'Clear' } }) });
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\ai-route.test.ts:30: const request = new Request('http://localhost/api/ai/generate', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ tool: 'idea-validator', input: { idea: '', audience: 'Creators' } }) });
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\ai-route.test.ts:36: const request = new Request('http://localhost/api/ai/generate', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://evil.example' }, body: JSON.stringify({ tool: 'idea-validator', input: {} }) });
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\project-layout.test.ts:14: expect(source).toContain("fetch(path");
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\route-authorization.test.ts:10: import { GET as getProjects } from '@/api/projects';
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\route-authorization.test.ts:11: import { PATCH as patchProject } from '@/api/projects/[id]';
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\route-authorization.test.ts:17: const response = await getProjects(new Request('http://localhost/api/projects'));
+C:\Users\zbook\Downloads\LaunchPilotAI-Fixed-Whop-Ready-v2\LaunchPilotAI-Fixed-Whop-Ready\tests\route-authorization.test.ts:22: const request = new Request('http://localhost/api/projects/project_B', { method: 'PATCH', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ title: 'Changed title' }) });

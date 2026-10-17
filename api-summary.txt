@@ -1,0 +1,153 @@
+﻿=== API ROUTE SUMMARY ===
+
+--- FILE: api\competitors.ts ---
+export async function GET(request: Request) {
+export async function POST(request: Request) {
+
+--- FILE: api\contact.ts ---
+export async function POST(request: Request) {
+
+--- FILE: api\projects.ts ---
+export const runtime = 'nodejs';
+export async function GET(request: Request) {
+export async function POST(request: Request) {
+
+--- FILE: api\settings.ts ---
+export async function PATCH(request: Request) {
+
+--- FILE: api\tasks.ts ---
+export async function GET(request: Request) {
+export async function POST(request: Request) {
+
+--- FILE: api\ai\generate.ts ---
+export const runtime = 'nodejs';
+export const maxDuration = 60;
+export async function POST(request: Request) {
+
+--- FILE: api\auth\callback.ts ---
+export const runtime = 'nodejs';
+export const maxDuration = 30;
+export async function GET(request: Request) {
+
+--- FILE: api\auth\login.ts ---
+export const runtime = 'nodejs';
+export async function POST(request: Request) {
+
+--- FILE: api\auth\logout.ts ---
+export async function POST(request: Request) {
+
+--- FILE: api\auth\me.ts ---
+export async function GET(request: Request) {
+
+--- FILE: api\auth\register.ts ---
+export const runtime = 'nodejs';
+export async function POST(request: Request) {
+
+--- FILE: api\auth\whop.ts ---
+export const runtime = 'nodejs';
+export async function GET(request: Request) {
+
+--- FILE: api\billing\refresh.ts ---
+export const runtime = 'nodejs';
+export async function POST(request: Request) {
+
+--- FILE: api\competitors\[id].ts ---
+(No matching handler export found)
+
+--- FILE: api\content\[id].ts ---
+(No matching handler export found)
+
+--- FILE: api\projects\[id].ts ---
+(No matching handler export found)
+
+--- FILE: api\tasks\[id].ts ---
+(No matching handler export found)
+
+--- FILE: api\webhooks\whop.ts ---
+export const runtime = 'nodejs';
+export const maxDuration = 30;
+export async function POST(request: Request) {
+
+=== BUILD CONFIGURATION: build.mjs ===
+import { execFileSync } from 'node:child_process';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = dirname(fileURLToPath(import.meta.url));
+const output = join(root, 'dist');
+
+// Prisma needs URL-shaped datasource values while generating its client, but it
+// does not connect to the database during generation. Placeholders are passed
+// to this child process only when real values have not been configured; they
+// are never written to .env or to the deployment environment.
+const env = { ...process.env };
+const fallbackDatabaseUrl = 'postgresql://placeholder:placeholder@127.0.0.1:5432/launchpilot_placeholder?schema=public';
+env.DATABASE_URL ||= fallbackDatabaseUrl;
+env.DIRECT_URL ||= env.DATABASE_URL;
+const prismaCommand = join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'prisma.cmd' : 'prisma');
+execFileSync(prismaCommand, ['generate'], {
+  cwd: root,
+  env,
+  stdio: 'inherit',
+  shell: process.platform === 'win32'
+});
+
+// Load only the public checkout URL from a local .env file. Vercel build
+// environment variables take precedence. No secrets are inserted into HTML.
+function parseEnvFile(text) {
+  const values = {};
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (!match || match[1] !== 'WHOP_PRO_CHECKOUT_URL') continue;
+    let value = match[2];
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    values[match[1]] = value;
+  }
+  return values;
+}
+
+const envText = await readFile(join(root, '.env'), 'utf8').catch(() => '');
+const localEnv = parseEnvFile(envText);
+const checkoutUrl = (process.env.WHOP_PRO_CHECKOUT_URL || localEnv.WHOP_PRO_CHECKOUT_URL || '').trim();
+if (checkoutUrl) {
+  let parsedCheckoutUrl;
+  try { parsedCheckoutUrl = new URL(checkoutUrl); } catch { throw new Error('WHOP_PRO_CHECKOUT_URL must be a valid HTTPS Whop checkout URL.'); }
+  if (parsedCheckoutUrl.protocol !== 'https:' || !(parsedCheckoutUrl.hostname === 'whop.com' || parsedCheckoutUrl.hostname.endsWith('.whop.com'))) {
+    throw new Error('WHOP_PRO_CHECKOUT_URL must use HTTPS and a whop.com domain.');
+  }
+}
+
+// The authoring file stays at the repository root. The public checkout URL is
+// injected during build, then only dist/index.html is served as the frontend.
+await rm(output, { recursive: true, force: true });
+await mkdir(output, { recursive: true });
+const html = await readFile(join(root, 'index.html'), 'utf8');
+const marker = "const CHECKOUT_URL = '__WHOP_PRO_CHECKOUT_URL__';";
+if (!html.includes(marker)) throw new Error('Checkout URL marker is missing from index.html.');
+const builtHtml = html.replace(marker, `const CHECKOUT_URL = ${JSON.stringify(checkoutUrl)};`);
+await writeFile(join(output, 'index.html'), builtHtml, 'utf8');
+console.log(checkoutUrl
+  ? 'LaunchPilot AI frontend built to dist/index.html with a configured Whop checkout URL.'
+  : 'LaunchPilot AI frontend built to dist/index.html. Pro checkout buttons are safely disabled until WHOP_PRO_CHECKOUT_URL is configured.');
+
+
+=== PACKAGE SCRIPTS ===
+{
+    "build":  "node build.mjs",
+    "dev":  "npm run build",
+    "start":  "npm run dev",
+    "typecheck":  "tsc --noEmit",
+    "test":  "vitest run",
+    "test:watch":  "vitest",
+    "db:generate":  "prisma generate",
+    "db:migrate":  "prisma migrate dev",
+    "db:deploy":  "prisma migrate deploy",
+    "db:studio":  "prisma studio"
+}
+
+=== VERCEL CONFIGURATION ===
+No vercel.json found
+
+=== API FILE COUNT ===
+TypeScript API files: 18

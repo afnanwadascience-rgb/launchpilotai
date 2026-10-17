@@ -1,4 +1,4 @@
-﻿import { unwrapWebhook } from '@whop/sdk/helpers';
+import { unwrapWebhook } from '@whop/sdk/helpers';
 import { EXACT_WHOP_CHECKOUT_URL, FREE_LIFETIME_GENERATIONS, PRO_MONTHLY_GENERATIONS } from './constants';
 import { db } from './db';
 
@@ -34,8 +34,9 @@ export function generationLimit(plan: 'FREE' | 'PRO'): number {
 }
 
 export function checkoutUrl(): string {
-  // Exact user-supplied value, intentionally not rebuilt or normalized.
-  return EXACT_WHOP_CHECKOUT_URL;
+  const configuredUrl = process.env.WHOP_PRO_CHECKOUT_URL?.trim() || "";
+  EXACT_WHOP_CHECKOUT_URL = configuredUrl;
+  return configuredUrl;
 }
 
 export async function fetchWhopMembership(membershipId: string): Promise<SubscriptionSnapshot> {
@@ -64,17 +65,26 @@ export function normalizeMembershipStatus(
   periodEnd?: string | null,
   now = new Date()
 ): { plan: 'FREE' | 'PRO'; status: string } {
-  const status = (rawStatus || '').toUpperCase();
-  const end = periodEnd ? new Date(periodEnd) : null;
-  const validFutureEnd = end !== null &&
-    Number.isFinite(end.getTime()) &&
-    end.getTime() > now.getTime();
+  const normalized = String(status ?? "").trim().toLowerCase();
 
-  if ((status === 'ACTIVE' || status === 'TRIALING') && validFutureEnd) {
-    return { plan: 'PRO', status };
+  switch (normalized) {
+    case "active":
+      return { plan: "PRO", status: "ACTIVE" };
+    case "trialing":
+      return { plan: "PRO", status: "TRIALING" };
+    case "past_due":
+    case "past-due":
+      return { plan: "FREE", status: "PAST_DUE" };
+    case "canceled":
+    case "cancelled":
+      return { plan: "FREE", status: "CANCELED" };
+    case "expired":
+      return { plan: "FREE", status: "EXPIRED" };
+    case "inactive":
+      return { plan: "FREE", status: "INACTIVE" };
+    default:
+      return { plan: "FREE", status: normalized ? normalized.toUpperCase() : "INACTIVE" };
   }
-
-  return { plan: 'FREE', status: status || 'INACTIVE' };
 }
 
 export async function syncMembershipForEmail(membership: SubscriptionSnapshot) {
@@ -108,10 +118,11 @@ export async function syncMembershipForEmail(membership: SubscriptionSnapshot) {
 /** Verify the raw Whop webhook bytes with Whop's official SDK helper. */
 export function verifyWhopWebhook(rawBody: string, headers: Headers, secret = process.env.WHOP_WEBHOOK_SECRET): boolean {
   if (!secret) return false;
+
   try {
     unwrapWebhook(rawBody, {
       headers: Object.fromEntries(headers.entries()),
-      key: secret
+      key: secret,
     });
     return true;
   } catch {

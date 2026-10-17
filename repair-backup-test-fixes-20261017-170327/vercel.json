@@ -1,0 +1,15 @@
+﻿{
+  "framework": null,
+  "outputDirectory": "dist",
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Content-Security-Policy",
+          "value": "frame-ancestors 'self' https://whop.com https://*.whop.com"
+        }
+      ]
+    }
+  ]
+}

@@ -4,7 +4,7 @@ export const FREE_LIFETIME_GENERATIONS = 3;
 export const PRO_MONTHLY_GENERATIONS = 100;
 export const FREE_PROJECT_LIMIT = 3;
 export const PRO_PROJECT_LIMIT = 100;
-export const EXACT_WHOP_CHECKOUT_URL = process.env.WHOP_PRO_CHECKOUT_URL?.trim() || '';
+export let EXACT_WHOP_CHECKOUT_URL = process.env.WHOP_PRO_CHECKOUT_URL?.trim() || "";
 export const ADVANCED_TOOLS = new Set(['sales-page-generator', 'pricing-assistant', 'marketing-kit']);
 
 export const TOOL_DETAILS = {
