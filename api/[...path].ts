@@ -10,12 +10,21 @@ const getHandler = (mod: any) => mod.default || mod.handler || mod;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    const { path } = req.query;
-    const segments = Array.isArray(path) ? path : path ? [path] : [];
-    const route = segments.join('/');
+    // Safely parse the path whether passed via Vercel query, dynamic route, or raw URL
+    let pathParam = req.query.path;
+    if (!pathParam && req.url) {
+      const cleanUrl = req.url.split('?')[0];
+      pathParam = cleanUrl.replace(/^\/api\/?/, '').split('/').filter(Boolean);
+    }
+    
+    const segments = Array.isArray(pathParam) ? pathParam : typeof pathParam === 'string' ? pathParam.split('/') : [];
+    const route = segments.filter(Boolean).join('/');
 
     if (!route || route === '') {
-      return res.status(200).json({ status: 'API Operational', endpoints: ['competitors', 'contact', 'projects', 'settings', 'tasks'] });
+      return res.status(200).json({ 
+        status: 'API Operational', 
+        endpoints: ['competitors', 'contact', 'projects', 'settings', 'tasks'] 
+      });
     }
 
     if (route.startsWith('competitors')) return await getHandler(competitorsMod)(req, res);
