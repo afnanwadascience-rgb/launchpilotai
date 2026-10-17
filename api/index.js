@@ -4,7 +4,13 @@ const projectsHandler = require('../server/handlers/projects');
 const settingsHandler = require('../server/handlers/settings');
 const tasksHandler = require('../server/handlers/tasks');
 
-const getHandler = (mod) => (mod && mod.default) ? mod.default : (mod && mod.handler) ? mod.handler : mod;
+const getHandler = (mod) => {
+  if (!mod) return null;
+  if (typeof mod === 'function') return mod;
+  if (mod.default && typeof mod.default === 'function') return mod.default;
+  if (mod.handler && typeof mod.handler === 'function') return mod.handler;
+  return null;
+};
 
 module.exports = async function handler(req, res) {
   try {
@@ -24,15 +30,20 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    if (route.startsWith('competitors')) return await getHandler(competitorsHandler)(req, res);
-    if (route.startsWith('contact')) return await getHandler(contactHandler)(req, res);
-    if (route.startsWith('projects')) return await getHandler(projectsHandler)(req, res);
-    if (route.startsWith('settings')) return await getHandler(settingsHandler)(req, res);
-    if (route.startsWith('tasks')) return await getHandler(tasksHandler)(req, res);
+    let targetHandler = null;
+    if (route.startsWith('competitors')) targetHandler = getHandler(competitorsHandler);
+    else if (route.startsWith('contact')) targetHandler = getHandler(contactHandler);
+    else if (route.startsWith('projects')) targetHandler = getHandler(projectsHandler);
+    else if (route.startsWith('settings')) targetHandler = getHandler(settingsHandler);
+    else if (route.startsWith('tasks')) targetHandler = getHandler(tasksHandler);
 
-    return res.status(404).json({ error: 'API route not found: /api/' + route });
+    if (!targetHandler) {
+      return res.status(404).json({ error: 'API route not found: /api/' + route });
+    }
+
+    return await targetHandler(req, res);
   } catch (error) {
-    console.error('Permanent Fix API Error:', error);
+    console.error('Critical API Invocation Error:', error);
     return res.status(500).json({
       error: 'Internal Server Error',
       message: error ? error.message : 'Unknown error'
