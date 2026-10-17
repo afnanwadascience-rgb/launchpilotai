@@ -1,4 +1,4 @@
-﻿import { unwrapWebhook } from '@whop/sdk/helpers';
+import { unwrapWebhook } from '@whop/sdk/helpers';
 import { EXACT_WHOP_CHECKOUT_URL, FREE_LIFETIME_GENERATIONS, PRO_MONTHLY_GENERATIONS } from './constants';
 import { db } from './db';
 
@@ -34,9 +34,7 @@ export function generationLimit(plan: 'FREE' | 'PRO'): number {
 }
 
 export function checkoutUrl(): string {
-  const configuredUrl = process.env.WHOP_PRO_CHECKOUT_URL?.trim() || "";
-  EXACT_WHOP_CHECKOUT_URL = configuredUrl;
-  return configuredUrl;
+  return process.env.WHOP_PRO_CHECKOUT_URL?.trim() || EXACT_WHOP_CHECKOUT_URL;
 }
 
 export async function fetchWhopMembership(membershipId: string): Promise<SubscriptionSnapshot> {
