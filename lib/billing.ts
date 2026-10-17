@@ -1,4 +1,4 @@
-import { unwrapWebhook } from '@whop/sdk/helpers';
+﻿import { unwrapWebhook } from '@whop/sdk/helpers';
 import { EXACT_WHOP_CHECKOUT_URL, FREE_LIFETIME_GENERATIONS, PRO_MONTHLY_GENERATIONS } from './constants';
 import { db } from './db';
 
@@ -133,5 +133,6 @@ export function verifyWhopWebhook(rawBody: string, headers: Headers, secret = pr
 export function isConfiguredProPlan(productId?: string, planId?: string): boolean {
   return Boolean(productId && planId && productId === process.env.WHOP_PRODUCT_ID && planId === process.env.WHOP_PRO_PLAN_ID);
 }
+
 
 
