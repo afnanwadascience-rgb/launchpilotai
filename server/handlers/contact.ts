@@ -1,8 +1,8 @@
-import { contactSchema } from '../lib/validators';
-import { getCurrentUser } from '../lib/auth';
-import { db } from '../lib/db';
-import { assertSameOrigin, getClientIp, jsonError, readJsonLimited } from '../lib/http';
-import { consumeRateLimit } from '../lib/rate-limit';
+import { contactSchema } from '../../lib/validators';
+import { getCurrentUser } from '../../lib/auth';
+import { db } from '../../lib/db';
+import { assertSameOrigin, getClientIp, jsonError, readJsonLimited } from '../../lib/http';
+import { consumeRateLimit } from '../../lib/rate-limit';
 
 export async function POST(request: Request) {
   if (!assertSameOrigin(request)) return jsonError('Request origin could not be validated.', 403);

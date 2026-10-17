@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import { requireApiUser } from '../lib/auth';
-import { db } from '../lib/db';
-import { assertSameOrigin, jsonError, readJsonLimited } from '../lib/http';
+import { requireApiUser } from '../../lib/auth';
+import { db } from '../../lib/db';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../../lib/http';
 
 const schema = z.object({ name: z.string().trim().min(1).max(80) });
 export async function PATCH(request: Request) {

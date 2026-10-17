@@ -1,9 +1,9 @@
-import { projectCreateSchema } from '../lib/validators';
-import { requireApiUser, getCurrentUser } from '../lib/auth';
-import { db } from '../lib/db';
-import { getPlanContext } from '../lib/usage';
-import { canCreateProject } from '../lib/policy';
-import { assertSameOrigin, jsonError, readJsonLimited } from '../lib/http';
+import { projectCreateSchema } from '../../lib/validators';
+import { requireApiUser, getCurrentUser } from '../../lib/auth';
+import { db } from '../../lib/db';
+import { getPlanContext } from '../../lib/usage';
+import { canCreateProject } from '../../lib/policy';
+import { assertSameOrigin, jsonError, readJsonLimited } from '../../lib/http';
 
 export const runtime = 'nodejs';
 export async function GET(request: Request) {
