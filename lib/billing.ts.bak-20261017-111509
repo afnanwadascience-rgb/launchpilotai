@@ -1,0 +1,125 @@
+﻿import { unwrapWebhook } from '@whop/sdk/helpers';
+import { EXACT_WHOP_CHECKOUT_URL, FREE_LIFETIME_GENERATIONS, PRO_MONTHLY_GENERATIONS } from './constants';
+import { db } from './db';
+
+export type SubscriptionSnapshot = {
+  id: string;
+  status?: string;
+  company?: { id?: string; title?: string } | null;
+  plan?: { id?: string } | null;
+  product?: { id?: string; title?: string } | null;
+  user?: { id?: string; email?: string; name?: string } | null;
+  renewal_period_start?: string | null;
+  renewal_period_end?: string | null;
+  cancel_at_period_end?: boolean;
+  canceled_at?: string | null;
+  [key: string]: unknown;
+};
+
+export function proIsActive(subscription: { plan: string; status: string; currentPeriodEnd: Date | null } | null, now = new Date()): boolean {
+  if (!subscription || subscription.plan !== 'PRO') return false;
+
+  const status = subscription.status.toUpperCase();
+  if (!['ACTIVE', 'TRIALING'].includes(status)) return false;
+
+  // Fail closed: an absent, invalid, or expired end date never grants Pro access.
+  const periodEnd = subscription.currentPeriodEnd;
+  if (!(periodEnd instanceof Date) || !Number.isFinite(periodEnd.getTime())) return false;
+
+  return periodEnd.getTime() > now.getTime();
+}
+
+export function generationLimit(plan: 'FREE' | 'PRO'): number {
+  return plan === 'PRO' ? PRO_MONTHLY_GENERATIONS : FREE_LIFETIME_GENERATIONS;
+}
+
+export function checkoutUrl(): string {
+  // Exact user-supplied value, intentionally not rebuilt or normalized.
+  return EXACT_WHOP_CHECKOUT_URL;
+}
+
+export async function fetchWhopMembership(membershipId: string): Promise<SubscriptionSnapshot> {
+  const token = process.env.WHOP_COMPANY_API_KEY || process.env.WHOP_API_KEY;
+  if (!token) throw new Error('WHOP_NOT_CONFIGURED');
+  if (!/^mem_[a-zA-Z0-9_-]{4,160}$/.test(membershipId)) throw new Error('INVALID_MEMBERSHIP_ID');
+  const response = await fetch(`https://api.whop.com/api/v1/memberships/${encodeURIComponent(membershipId)}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(10_000)
+  });
+  if (!response.ok) throw new Error(response.status === 404 ? 'MEMBERSHIP_NOT_FOUND' : 'WHOP_API_ERROR');
+  return response.json() as Promise<SubscriptionSnapshot>;
+}
+
+export function membershipMatchesConfiguredProduct(membership: SubscriptionSnapshot): boolean {
+  const expectedCompany = process.env.WHOP_COMPANY_ID;
+  const expectedProduct = process.env.WHOP_PRODUCT_ID;
+  const expectedPlan = process.env.WHOP_PRO_PLAN_ID;
+  if (!expectedCompany || !expectedProduct || !expectedPlan) return false;
+  return membership.company?.id === expectedCompany && membership.product?.id === expectedProduct && membership.plan?.id === expectedPlan;
+}
+
+export function normalizeMembershipStatus(
+  rawStatus?: string | null,
+  periodEnd?: string | null,
+  now = new Date()
+): { plan: 'FREE' | 'PRO'; status: string } {
+  const status = (rawStatus || '').toUpperCase();
+  const end = periodEnd ? new Date(periodEnd) : null;
+  const validFutureEnd = end !== null &&
+    Number.isFinite(end.getTime()) &&
+    end.getTime() > now.getTime();
+
+  if ((status === 'ACTIVE' || status === 'TRIALING') && validFutureEnd) {
+    return { plan: 'PRO', status };
+  }
+
+  return { plan: 'FREE', status: status || 'INACTIVE' };
+}
+
+export async function syncMembershipForEmail(membership: SubscriptionSnapshot) {
+  if (!membershipMatchesConfiguredProduct(membership) || !membership.user?.email) return false;
+  const email = membership.user.email.trim().toLowerCase();
+  const user = await db.user.findUnique({ where: { email }, select: { id: true } });
+  if (!user) return false;
+  const actual = normalizeMembershipStatus(membership.status, membership.renewal_period_end);
+  const periodStart = membership.renewal_period_start ? new Date(membership.renewal_period_start) : null;
+  const periodEnd = membership.renewal_period_end ? new Date(membership.renewal_period_end) : null;
+  await db.subscription.upsert({
+    where: { userId: user.id },
+    create: {
+      userId: user.id, plan: actual.plan, status: actual.status,
+      whopMembershipId: membership.id, whopProductId: membership.product?.id || null,
+      whopPlanId: membership.plan?.id || null, currentPeriodStart: periodStart,
+      currentPeriodEnd: periodEnd, cancelAtPeriodEnd: membership.cancel_at_period_end || false,
+      lastVerifiedAt: new Date()
+    },
+    update: {
+      plan: actual.plan, status: actual.status,
+      whopMembershipId: membership.id, whopProductId: membership.product?.id || null,
+      whopPlanId: membership.plan?.id || null, currentPeriodStart: periodStart,
+      currentPeriodEnd: periodEnd, cancelAtPeriodEnd: membership.cancel_at_period_end || false,
+      lastVerifiedAt: new Date()
+    }
+  });
+  return true;
+}
+
+/** Verify the raw Whop webhook bytes with Whop's official SDK helper. */
+export function verifyWhopWebhook(rawBody: string, headers: Headers, secret = process.env.WHOP_WEBHOOK_SECRET): boolean {
+  if (!secret) return false;
+  try {
+    unwrapWebhook(rawBody, {
+      headers: Object.fromEntries(headers.entries()),
+      key: secret
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isConfiguredProPlan(productId?: string, planId?: string): boolean {
+  return Boolean(productId && planId && productId === process.env.WHOP_PRODUCT_ID && planId === process.env.WHOP_PRO_PLAN_ID);
+}
+
