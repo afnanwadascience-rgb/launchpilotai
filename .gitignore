@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.vercel/
+
+.vercel
+.env*.local
+.aider-desk/mcp-servers.json
+.aider-desk/
+.agents/
+.idea/
+*.zip
