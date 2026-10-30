@@ -14,7 +14,7 @@ export async function generateWithGroq(tool: AiTool, input: Record<string, unkno
   if (!apiKey) throw new Error('GROQ_NOT_CONFIGURED');
   const groq = new Groq({ apiKey, timeout: 45_000, maxRetries: 1 });
   const completion = await groq.chat.completions.create({
-    model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+    model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
     temperature: 0.55,
     max_tokens: 2400,
     messages: [
